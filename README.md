@@ -1,6 +1,10 @@
-# copycmd
+<p align="center">
+  <img src="logo.png" alt="copycmd logo" width="150" />
+</p>
 
-A ZSH plugin that automatically detects commands in your terminal output and places a clickable **[⧉]** copy button next to each one. Click it, and the command is copied to your clipboard.
+<h1 align="center">copycmd</h1>
+
+<p align="center">A ZSH plugin that automatically detects commands in your terminal output and places a clickable <strong>[⧉]</strong> copy button next to each one. Click it, and the command is copied to your clipboard.</p>
 
 Works with any terminal that supports [OSC 8 hyperlinks](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda) — including **Ghostty**, **iTerm2**, **Kitty**, **WezTerm**, and others.
 
