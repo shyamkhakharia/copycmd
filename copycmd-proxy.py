@@ -22,8 +22,10 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
 import termios
+import time
 import tty
 
 # ── Command patterns to detect ─────────────────────────────────────
@@ -74,26 +76,197 @@ BACKTICK_CMD_WORDS = {
     'source', 'ln', 'cd', 'make', 'npx', 'bunx',
 }
 
-# CSI escape sequence pattern — indicates TUI activity
-# If a chunk has cursor movement, don't process it
-TUI_INDICATORS = re.compile(
-    rb'\x1b\[\d*[ABCDHJ]'   # cursor up/down/forward/back, erase
-    rb'|\x1b\[\d*;\d*[Hf]'  # cursor position
-    rb'|\x1b\[\?(?:1049|47|1047)[hl]'  # alt screen buffer
-    rb'|\x1b\[2J'            # clear screen
-)
+# Strip ANSI SGR (color/style) sequences for command extraction
+SGR_RE = re.compile(r'\x1b\[\d*(?:;\d+)*m')
+
+# ── TUI Detection (Layer 2: escape sequence scoring) ───────────────
+CSI_CURSOR_POS = re.compile(rb'\x1b\[\d+;\d+[Hf]')
+CSI_CURSOR_REL = re.compile(rb'\x1b\[\d*[ABCD]')
+CSI_LINE_CLEAR = re.compile(rb'\x1b\[\d*K')
+CSI_SCREEN_CLEAR = re.compile(rb'\x1b\[2J')
+CSI_CURSOR_VIS = re.compile(rb'\x1b\[\?25[hl]')
+CSI_LINE_MANIP = re.compile(rb'\x1b\[\d*[LM]')
+CSI_SCROLL_REGION = re.compile(rb'\x1b\[\d+;\d+r')
+PROMPT_PATTERN = re.compile(rb'[\$%#>] \s*$', re.MULTILINE)
+
+# macOS ioctl to get foreground process group
+TIOCGPGRP = 0x40047477
 
 
-def make_copy_button(cmd: str) -> str:
+# ── Proxy State ────────────────────────────────────────────────────
+
+class ProxyState:
+    """Tracks TUI detection state across output chunks."""
+
+    KNOWN_TUI_PROCESSES = {
+        # Editors
+        'vim', 'nvim', 'vi', 'nano', 'emacs', 'micro', 'helix', 'joe', 'ne',
+        'code',
+        # Pagers
+        'less', 'more', 'man', 'bat',
+        # Monitors
+        'top', 'htop', 'btop', 'nmon', 'watch',
+        # Multiplexers
+        'tmux', 'screen', 'zellij', 'byobu',
+        # Fuzzy finders
+        'fzf',
+        # Remote
+        'ssh', 'mosh', 'telnet',
+        # REPLs
+        'python3', 'python', 'python2', 'node', 'irb', 'ruby', 'lua',
+        'ghci', 'iex', 'erl', 'scala',
+        # Shells (when run as subshell)
+        'bash', 'zsh', 'fish', 'sh',
+        # Databases
+        'mysql', 'psql', 'sqlite3', 'redis-cli', 'mongosh',
+        # Git TUIs
+        'tig', 'lazygit', 'lazydocker',
+        # AI tools
+        'claude', 'aider', 'cursor',
+        # Other
+        'su',
+    }
+
+    # Process names to check args for (they're generic runtimes)
+    RUNTIME_PROCESSES = {'node', 'python3', 'python', 'ruby'}
+
+    # Keywords in args that indicate a TUI
+    TUI_ARG_KEYWORDS = {'claude', 'aider', 'cursor', 'ipython', 'bpython'}
+
+    def __init__(self, master_fd, child_pid):
+        self.master_fd = master_fd
+        self.child_pid = child_pid
+        self.in_alt_screen = False
+        self.tui_score = 0.0
+        self.last_output_time = time.monotonic()
+        self.fg_cache_time = 0.0
+        self.fg_cache_result = None
+        # Track the shell's own PID so we don't skip it
+        self.shell_pid = child_pid
+
+    def get_foreground_process(self):
+        """Get the name of the foreground process in the PTY."""
+        now = time.monotonic()
+        # Cache for 500ms
+        if now - self.fg_cache_time < 0.5:
+            return self.fg_cache_result
+
+        try:
+            # Get foreground process group from PTY master
+            buf = struct.pack('i', 0)
+            result = fcntl.ioctl(self.master_fd, TIOCGPGRP, buf)
+            pgrp = struct.unpack('i', result)[0]
+
+            # If it's the shell itself, not a TUI
+            if pgrp == self.shell_pid:
+                self.fg_cache_time = now
+                self.fg_cache_result = None
+                return None
+
+            # Get process name
+            out = subprocess.check_output(
+                ['ps', '-o', 'comm=', '-p', str(pgrp)],
+                timeout=0.1, stderr=subprocess.DEVNULL
+            ).decode().strip()
+            name = os.path.basename(out)
+
+            # For runtime processes (node, python), check the full args
+            if name in self.RUNTIME_PROCESSES:
+                try:
+                    args = subprocess.check_output(
+                        ['ps', '-o', 'args=', '-p', str(pgrp)],
+                        timeout=0.1, stderr=subprocess.DEVNULL
+                    ).decode().strip().lower()
+                    for kw in self.TUI_ARG_KEYWORDS:
+                        if kw in args:
+                            name = kw
+                            break
+                except Exception:
+                    pass
+
+            self.fg_cache_time = now
+            self.fg_cache_result = name
+            return name
+        except Exception:
+            self.fg_cache_time = now
+            self.fg_cache_result = None
+            return None
+
+    def update_score(self, data):
+        """Update TUI probability score based on escape sequences in data."""
+        now = time.monotonic()
+        elapsed = now - self.last_output_time
+        self.last_output_time = now
+
+        # Time-based decay (when output pauses, score drops)
+        if elapsed > 0.05:
+            decay_steps = min(elapsed / 0.1, 20)
+            self.tui_score *= (0.85 ** decay_steps)
+
+        # Count TUI-indicative sequences
+        pos_count = len(CSI_CURSOR_POS.findall(data))
+        rel_count = len(CSI_CURSOR_REL.findall(data))
+        clear_count = len(CSI_LINE_CLEAR.findall(data))
+
+        self.tui_score += pos_count * 0.4
+        self.tui_score += rel_count * 0.1
+        self.tui_score += clear_count * 0.2
+        self.tui_score += len(CSI_SCREEN_CLEAR.findall(data)) * 0.5
+        self.tui_score += len(CSI_CURSOR_VIS.findall(data)) * 0.3
+        self.tui_score += len(CSI_LINE_MANIP.findall(data)) * 0.3
+        self.tui_score += len(CSI_SCROLL_REGION.findall(data)) * 0.5
+
+        # Decay signals: plain text output
+        if b'\n' in data and pos_count == 0 and rel_count == 0:
+            self.tui_score -= 0.3
+
+        # Shell prompt is a strong signal we're back to plain text
+        if PROMPT_PATTERN.search(data):
+            self.tui_score -= 0.5
+
+        # Clamp
+        self.tui_score = max(0.0, min(1.0, self.tui_score))
+
+    def is_tui_active(self, data):
+        """Three-layer TUI detection. Returns True if output should pass through."""
+
+        # Layer 3: Alt-screen buffer (fast path, definitive)
+        if b'\x1b[?1049h' in data or b'\x1b[?47h' in data:
+            self.in_alt_screen = True
+        if b'\x1b[?1049l' in data or b'\x1b[?47l' in data:
+            self.in_alt_screen = False
+            self.tui_score = 0.0  # Reset score on alt-screen exit
+
+        if self.in_alt_screen:
+            return True
+
+        # Layer 1: Known foreground process
+        fg = self.get_foreground_process()
+        if fg and fg in self.KNOWN_TUI_PROCESSES:
+            return True
+
+        # Layer 2: Escape sequence density scoring
+        self.update_score(data)
+        if self.tui_score > 0.5:
+            return True
+
+        return False
+
+
+# ── Core Functions ─────────────────────────────────────────────────
+
+def make_copy_button(cmd):
     """Generate an OSC 8 hyperlink copy button for a command."""
     encoded = base64.b64encode(cmd.encode()).decode()
-    return f'  \x1b]8;;copycmd://{encoded}\x07\x1b[48;5;238;38;5;117m copy \x1b[0m\x1b]8;;\x07'
+    return '  \x1b]8;;copycmd://{}\x07\x1b[48;5;238;38;5;117m copy \x1b[0m\x1b]8;;\x07'.format(encoded)
 
 
-def extract_command(line: str) -> str | None:
+def extract_command(line):
     """Extract a copyable command from a line of text, if any."""
-    # Strip leading whitespace and common prompt prefixes
-    stripped = line.strip()
+    # Strip ANSI color codes first
+    line_clean = SGR_RE.sub('', line)
+
+    stripped = line_clean.strip()
     for prefix in ('$ ', '> ', '% '):
         if stripped.startswith(prefix):
             stripped = stripped[len(prefix):]
@@ -115,7 +288,7 @@ def extract_command(line: str) -> str | None:
             return cmd.strip()
 
     # Check backtick-wrapped commands in original line
-    for m in BACKTICK_RE.finditer(line):
+    for m in BACKTICK_RE.finditer(line_clean):
         inner = m.group(1)
         first_word = inner.split()[0] if inner.split() else ''
         if first_word in BACKTICK_CMD_WORDS:
@@ -124,21 +297,11 @@ def extract_command(line: str) -> str | None:
     return None
 
 
-def process_output(data: bytes, in_tui: list) -> bytes:
+def process_output(data, state):
     """Process terminal output, injecting copy buttons where appropriate."""
 
-    # Detect TUI mode (alt screen buffer)
-    if b'\x1b[?1049h' in data or b'\x1b[?47h' in data:
-        in_tui[0] = True
-    if b'\x1b[?1049l' in data or b'\x1b[?47l' in data:
-        in_tui[0] = False
-
-    # Don't process in TUI mode
-    if in_tui[0]:
-        return data
-
-    # Don't process chunks with cursor movement (partial TUI rendering)
-    if TUI_INDICATORS.search(data):
+    # Check all three TUI detection layers
+    if state.is_tui_active(data):
         return data
 
     try:
@@ -172,6 +335,8 @@ def process_output(data: bytes, in_tui: list) -> bytes:
 
     return '\n'.join(result_lines).encode('utf-8', errors='replace')
 
+
+# ── PTY Proxy ──────────────────────────────────────────────────────
 
 def set_winsize(fd, rows, cols):
     """Set the window size of a PTY."""
@@ -240,22 +405,22 @@ def main():
     def handle_sigwinch(signum, frame):
         rows, cols = get_winsize(sys.stdin.fileno())
         set_winsize(master_fd, rows, cols)
-        # Forward SIGWINCH to child
         os.kill(pid, signal.SIGWINCH)
 
     signal.signal(signal.SIGWINCH, handle_sigwinch)
 
-    in_tui = [False]  # mutable flag for TUI mode tracking
+    state = ProxyState(master_fd, pid)
 
     try:
         while True:
             try:
-                rlist, _, _ = select.select([sys.stdin.fileno(), master_fd], [], [], 0.1)
+                rlist, _, _ = select.select(
+                    [sys.stdin.fileno(), master_fd], [], [], 0.1
+                )
             except (select.error, InterruptedError):
                 continue
 
             if sys.stdin.fileno() in rlist:
-                # Input from terminal → send to shell
                 try:
                     data = os.read(sys.stdin.fileno(), 4096)
                 except OSError:
@@ -265,25 +430,22 @@ def main():
                 os.write(master_fd, data)
 
             if master_fd in rlist:
-                # Output from shell → process and send to terminal
                 try:
-                    data = os.read(master_fd, 4096)
+                    data = os.read(master_fd, 16384)
                 except OSError:
                     break
                 if not data:
                     break
 
-                processed = process_output(data, in_tui)
+                processed = process_output(data, state)
                 os.write(sys.stdout.fileno(), processed)
 
     except KeyboardInterrupt:
         pass
     finally:
-        # Restore terminal
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, old_attrs)
         os.close(master_fd)
 
-        # Wait for child
         try:
             os.waitpid(pid, 0)
         except ChildProcessError:
