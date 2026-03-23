@@ -4,14 +4,14 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="${HOME}/.copycmd"
-PLUGIN_FILE="copycmd.plugin.zsh"
-ZSHRC="${HOME}/.zshrc"
+GHOSTTY_CONFIG="${HOME}/.config/ghostty/config"
 
 echo "Installing copycmd..."
 mkdir -p "$INSTALL_DIR"
 
-# 1. Install plugin
-cp "$SCRIPT_DIR/$PLUGIN_FILE" "$INSTALL_DIR/"
+# 1. Install the PTY proxy
+cp "$SCRIPT_DIR/copycmd-proxy.py" "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/copycmd-proxy.py"
 
 # 2. Build the URL scheme handler (macOS app for click-to-copy)
 echo "Building URL handler..."
@@ -29,22 +29,36 @@ PLIST="$INSTALL_DIR/CopyCmd.app/Contents/Info.plist"
 # Register with macOS
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -R "$INSTALL_DIR/CopyCmd.app"
 
-# 3. Add to .zshrc
-if grep -q "copycmd" "$ZSHRC" 2>/dev/null; then
-  echo "copycmd already in .zshrc (updated plugin file)"
+# 3. Configure Ghostty to use the proxy
+if [ -f "$GHOSTTY_CONFIG" ]; then
+  if grep -q "copycmd" "$GHOSTTY_CONFIG" 2>/dev/null; then
+    echo "Ghostty already configured for copycmd"
+  else
+    echo "" >> "$GHOSTTY_CONFIG"
+    echo "# copycmd — inline copy buttons for commands in terminal output" >> "$GHOSTTY_CONFIG"
+    echo "command = ${INSTALL_DIR}/copycmd-proxy.py" >> "$GHOSTTY_CONFIG"
+    echo "Added copycmd proxy to Ghostty config"
+  fi
 else
-  echo "" >> "$ZSHRC"
-  echo "# copycmd - inline copy buttons for commands in terminal output" >> "$ZSHRC"
-  echo "source ${INSTALL_DIR}/${PLUGIN_FILE}" >> "$ZSHRC"
-  echo "Added copycmd to $ZSHRC"
+  echo ""
+  echo "⚠ Ghostty config not found at $GHOSTTY_CONFIG"
+  echo "  Add this line to your Ghostty config manually:"
+  echo "  command = ${INSTALL_DIR}/copycmd-proxy.py"
+fi
+
+# 4. Remove old ZSH plugin from .zshrc if present
+ZSHRC="${HOME}/.zshrc"
+if grep -q "copycmd" "$ZSHRC" 2>/dev/null; then
+  # Remove old copycmd lines
+  sed -i '' '/copycmd/d' "$ZSHRC"
+  echo "Removed old copycmd ZSH plugin from .zshrc (no longer needed)"
 fi
 
 echo ""
 echo "✓ copycmd installed!"
 echo ""
-echo "Restart your shell or run: source ${INSTALL_DIR}/${PLUGIN_FILE}"
+echo "Restart Ghostty and every command's output will have clickable"
+echo " copy  buttons next to detected commands."
 echo ""
-echo "How it works:"
-echo "  Just use your terminal normally. When output contains commands like"
-echo "  'npm install' or 'git clone ...', a clickable [⧉] button appears"
-echo "  next to them. Click it to copy the command to your clipboard."
+echo "Works with everything — cat, claude, npm, any program."
+echo "Cmd+click the  copy  button to copy the command to clipboard."

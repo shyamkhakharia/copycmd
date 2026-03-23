@@ -8,14 +8,29 @@ COPYCMD_BUTTON=" \033[90m[\033[0m\033[36m⧉\033[0m\033[90m]\033[0m"  # styled [
 
 # Commands that are interactive/TUI — skip capture for these
 typeset -a COPYCMD_SKIP_COMMANDS=(
-  vim nvim vi nano emacs code
-  less more man
-  top htop btop
-  tmux screen
+  # Editors
+  vim nvim vi nano emacs code micro helix joe ne
+  # Pagers
+  less more man bat
+  # System monitors
+  top htop btop nmon watch
+  # Multiplexers
+  tmux screen zellij byobu
+  # Fuzzy finders
   fzf
-  ssh mosh
-  python3 python node irb
-  mysql psql sqlite3 redis-cli
+  # Remote access
+  ssh mosh telnet
+  # REPLs & interpreters
+  python3 python python2 node irb ruby lua ghci iex erl scala
+  bash zsh fish sh
+  # Databases
+  mysql psql sqlite3 redis-cli mongosh
+  # Git TUIs
+  tig lazygit lazydocker
+  # AI tools
+  claude aider cursor
+  # Shells
+  su
 )
 
 mkdir -p "$COPYCMD_TMPDIR"
@@ -151,7 +166,7 @@ _copycmd_filter() {
     _ccf_cmd=$(_copycmd_extract "$_ccf_line" 2>/dev/null)
     if [[ -n "$_ccf_cmd" ]]; then
       _ccf_enc=$(printf '%s' "$_ccf_cmd" | base64 | tr -d '\n')
-      printf '%s \033]8;;copycmd://%s\a\033[90m[\033[36m⧉\033[90m]\033[0m\033]8;;\a\n' "$_ccf_line" "$_ccf_enc"
+      printf '%s  \033]8;;copycmd://%s\a\033[48;5;238;38;5;117m copy \033[0m\033]8;;\a\n' "$_ccf_line" "$_ccf_enc"
     else
       printf '%s\n' "$_ccf_line"
     fi
@@ -175,9 +190,19 @@ _copycmd_should_skip() {
     [[ "$base_cmd" == "$skip" ]] && return 0
   done
 
+  # Skip pipes to interactive tools
   [[ "$cmd" == *"| less"* ]] && return 0
   [[ "$cmd" == *"| more"* ]] && return 0
   [[ "$cmd" == *"| fzf"* ]] && return 0
+  [[ "$cmd" == *"| bat"* ]] && return 0
+
+  # Skip long-running servers/watchers
+  [[ "$cmd" == *"--watch"* ]] && return 0
+  [[ "$cmd" == *"serve"* ]] && return 0
+  [[ "$base_cmd" == "npm" && "$cmd" == *"start"* ]] && return 0
+  [[ "$base_cmd" == "npm" && "$cmd" == *"dev"* ]] && return 0
+  [[ "$base_cmd" == "yarn" && "$cmd" == *"start"* ]] && return 0
+  [[ "$base_cmd" == "yarn" && "$cmd" == *"dev"* ]] && return 0
 
   return 1
 }

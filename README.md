@@ -4,43 +4,36 @@
 
 <h1 align="center">copycmd</h1>
 
-<p align="center">A ZSH plugin that automatically detects commands in your terminal output and places a clickable <strong>[⧉]</strong> copy button next to each one. Click it, and the command is copied to your clipboard.</p>
+<p align="center">Automatically detects commands in terminal output and adds a clickable <code> copy </code> button next to each one. Click it, and the command is copied to your clipboard.</p>
 
-Works with any terminal that supports [OSC 8 hyperlinks](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda) — including **Ghostty**, **iTerm2**, **Kitty**, **WezTerm**, and others.
+<p align="center">Works with <strong>everything</strong> — claude, cat, npm, curl, any program. No prefixes, no wrappers, just use your terminal normally.</p>
 
-## Demo
+## How it works
 
-When a command's output contains recognizable commands, copy buttons appear inline:
+copycmd is a lightweight PTY proxy that sits between your terminal emulator and your shell. Every program still sees a real TTY (so nothing breaks — not even TUI apps), but the output stream is scanned for recognizable commands and a clickable ` copy ` button is injected inline.
 
 ```
 $ cat README.md
 To get started:
-  npm install --save-dev typescript  [⧉]    ← click to copy
-  git clone https://github.com/foo/bar.git  [⧉]    ← click to copy
+  npm install --save-dev typescript  ┃ copy ┃    ← Cmd+click to copy
+  git clone https://github.com/foo/bar.git  ┃ copy ┃
 
 Regular text has no button.
 ```
 
-Clicking `[⧉]` copies that command to your clipboard and shows a macOS notification.
-
-## How it works
-
-1. **ZSH hooks** (`preexec`/`precmd`) intercept command output transparently — no prefix or wrapper needed
-2. A **stream filter** processes output line-by-line, detects command patterns, and appends a clickable `[⧉]` using OSC 8 hyperlinks
-3. Each `[⧉]` links to a `copycmd://` URL containing the base64-encoded command
-4. A lightweight **macOS URL scheme handler** (AppleScript app) receives the click, decodes the command, copies it to your clipboard, and shows a notification
+When you Cmd+click ` copy `, the command is copied to your clipboard and you get a macOS notification confirming it.
 
 ## Requirements
 
-- macOS (for the URL scheme handler — the ZSH plugin itself is cross-platform)
-- ZSH shell
+- macOS (for the URL scheme handler — the proxy itself is cross-platform Python)
+- Python 3 (pre-installed on macOS)
 - A terminal with OSC 8 hyperlink support:
   - **Ghostty** ✓
   - **iTerm2** ✓ (3.1+)
   - **Kitty** ✓
   - **WezTerm** ✓
   - **Alacritty** ✓ (0.11+)
-  - **macOS Terminal.app** ✗ (buttons show visually but are not clickable)
+  - **macOS Terminal.app** ✗ (buttons show but aren't clickable)
 
 ## Installation
 
@@ -52,21 +45,29 @@ cd copycmd
 
 The installer will:
 
-1. Copy the plugin to `~/.copycmd/`
-2. Build and register the `CopyCmd.app` URL scheme handler
-3. Add `source ~/.copycmd/copycmd.plugin.zsh` to your `~/.zshrc`
+1. Copy the PTY proxy to `~/.copycmd/`
+2. Build and register the `CopyCmd.app` URL scheme handler (for click-to-copy)
+3. Add `command = ~/.copycmd/copycmd-proxy.py` to your Ghostty config
 
-Then restart your shell or run:
+Then **restart Ghostty** — that's it.
 
-```bash
-source ~/.copycmd/copycmd.plugin.zsh
+### Manual setup (other terminals)
+
+For non-Ghostty terminals, configure your terminal to run the proxy as its shell/command:
+
+**iTerm2:** Preferences → Profiles → General → Command → `~/.copycmd/copycmd-proxy.py`
+
+**Kitty:** Add to `kitty.conf`:
+```
+shell ~/.copycmd/copycmd-proxy.py
 ```
 
-## Usage
+**WezTerm:** Add to `wezterm.lua`:
+```lua
+config.default_prog = { os.getenv("HOME") .. "/.copycmd/copycmd-proxy.py" }
+```
 
-**There's nothing to do.** Just use your terminal normally. Commands detected in output will automatically have a `[⧉]` button next to them.
-
-### What it detects
+## What it detects
 
 - **Package managers**: `npm install`, `yarn add`, `pip install`, `brew install`, `cargo install`, `apt-get install`, etc.
 - **Git**: `git clone`, `git checkout`, `git push`, `git pull`, `git stash`, etc.
@@ -74,47 +75,16 @@ source ~/.copycmd/copycmd.plugin.zsh
 - **Shell operations**: `export`, `source`, `sudo`, `mkdir -p`, `chmod`, etc.
 - **Backtick-wrapped commands**: `` `brew install node` `` in output text
 
-### Helper commands
+## TUI apps
 
-| Command | Description |
-| --- | --- |
-| `cc-toggle` | Enable/disable copycmd |
-
-### Skipped commands
-
-Interactive/TUI programs are automatically skipped to avoid breaking their display:
-
-`vim`, `nvim`, `nano`, `less`, `top`, `htop`, `tmux`, `ssh`, `fzf`, `python`, `node`, `mysql`, `psql`, etc.
-
-## Configuration
-
-Set these in your `.zshrc` before sourcing the plugin:
-
-```bash
-# Disable copycmd on load (default: true)
-COPYCMD_ENABLED=false
-
-# Add commands to the skip list
-COPYCMD_SKIP_COMMANDS+=(my-tui-app another-interactive-tool)
-```
-
-### Adding custom patterns
-
-Edit the `COPYCMD_PATTERNS` array in `copycmd.plugin.zsh` to add your own detection patterns. Patterns use ZSH extended regex:
-
-```bash
-COPYCMD_PATTERNS+=(
-  'my-cli-tool[[:space:]].+'
-  'custom-command[[:space:]].+'
-)
-```
+TUI programs (vim, claude, htop, etc.) are automatically detected via alt-screen buffer switching and cursor movement escape sequences. When a TUI is active, copycmd passes output through unmodified — no interference.
 
 ## How the URL handler works
 
 The installer builds a minimal macOS app (`~/.copycmd/CopyCmd.app`) using AppleScript that:
 
 1. Registers the `copycmd://` URL scheme with macOS Launch Services
-2. When a `copycmd://` URL is opened (by clicking `[⧉]` in the terminal), it decodes the base64 payload
+2. When a `copycmd://` URL is opened (by Cmd+clicking ` copy `), it decodes the base64 payload
 3. Copies the decoded command to your clipboard
 4. Shows a macOS notification confirming the copy
 
@@ -123,7 +93,7 @@ The app runs as a background-only process (no Dock icon).
 ## Uninstalling
 
 ```bash
-# Remove from .zshrc (delete the copycmd lines)
+# Remove Ghostty config line (delete the copycmd lines)
 # Remove installed files
 rm -rf ~/.copycmd
 ```
